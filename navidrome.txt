@@ -1,0 +1,166 @@
+Setting up Navidrome music server on rasberry pi.
+
+1. Download the latest Navidrome release:
+-----------------------------------------
+Find the latest linux release link at https://github.com/navidrome/navidrome/releases
+We will use wget to pull down the tar file for the arm64 architecture (or change depending on your Pi version):
+
+    > wget https://github.com/navidrome/navidrome/releases/download/v0.64.2/navidrome_0.64.2_linux_arm64.tar.gz
+
+2. Extract and prepare installation directories:
+------------------------------------------------
+
+    > tar -xvzf navidrome_0.64.2_linux_arm64.tar.gz
+    > sudo install -d -o root -g root -m 755 /opt/navidrome
+    > sudo install -d -o root -g root -m 755 /var/lib/navidrome
+
+3. Create the navidrome user and configure permissions:
+-------------------------------------------------------
+
+Move the binary to the execution folder:
+    > sudo mv navidrome /opt/navidrome/
+
+Create a system user called navidrome that cannot login:
+    > sudo useradd -r -s /bin/false navidrome
+
+Set ownership of the working directory to the navidrome user:
+    > sudo chown -R navidrome:navidrome /var/lib/navidrome
+
+4. Configure Navidrome settings:
+--------------------------------
+
+Create and edit the configuration file with your preferred editor:
+    > sudo nano /var/lib/navidrome/navidrome.toml
+
+Add the following to tell Navidrome where your music is located.
+We're pointing it to the mounted NTFS drive:
+
+    MusicFolder = "/mnt/norman_2tb/Backups/psych"
+    DataFolder = "/var/lib/navidrome"
+    LogLevel = "info"
+
+    [Tags.CatalogNumber]
+    Aliases = ["catalog", "catalognumber"]
+
+    [Tags.Label]
+    Aliases = ["label", "recordlabel", "organization", "publisher"]
+
+    [Tags.Rating]
+    Aliases = ["rating"]
+    Type = "int"
+
+5. Set up systemd to manage Navidrome automatically:
+----------------------------------------------------
+
+Create a new service file:
+    > sudo nano /etc/systemd/system/navidrome.service
+
+Paste the following content into it:
+
+    [Unit]
+    Description=Navidrome Music Server and Streamer compatible with Subsonic/Airsonic
+    After=network.target
+
+    [Service]
+    User=navidrome
+    Group=navidrome
+    Type=simple
+    ExecStart=/opt/navidrome/navidrome --configfile "/var/lib/navidrome/navidrome.toml"
+    WorkingDirectory=/var/lib/navidrome
+    TimeoutStopSec=20
+    KillMode=process
+    Restart=on-failure
+
+    # Hardening
+    DevicePolicy=closed
+    NoNewPrivileges=yes
+    PrivateTmp=yes
+    PrivateUsers=yes
+    ProtectControlGroups=yes
+    ProtectKernelModules=yes
+    ProtectKernelTunables=yes
+    RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+    RestrictNamespaces=yes
+    RestrictRealtime=yes
+    SystemCallFilter=~@clock @debug @module @mount @obsolete @reboot @setuid @cpu-emulation @mac
+
+    [Install]
+    WantedBy=multi-user.target
+
+6. Start the Navidrome service:
+-------------------------------
+
+Reload systemd to pick up the new service, then start and enable it to run on boot:
+
+    > sudo systemctl daemon-reload
+    > sudo systemctl enable --now navidrome.service
+
+Check that it's running successfully:
+    > sudo systemctl status navidrome.service
+
+7. Using Navidrome:
+-------------------
+
+You can now access Navidrome in your browser by going to:
+http://<your_pi_ip_address>:4533
+
+The first time you visit, you will be prompted to create an admin user and password.
+Once logged in, your music will be scanned and available to stream!
+
+8. Sharing Navidrome with friends (via Tailscale):
+--------------------------------------------------
+
+Since you have Tailscale installed, Navidrome is already accessible to anyone on your Tailnet. 
+To let a friend use your Navidrome server, follow these steps:
+
+1. Log into your Navidrome admin account.
+2. Go to the top right and click the gear icon to open Settings.
+3. Navigate to the "Users" tab and click the "Create User" button.
+4. Fill in a username and a temporary password for your friend (make sure "Admin" is unchecked).
+5. Click Save.
+
+Share the following URL and the temporary credentials with your friend:
+http://100.78.8.74:4533  (or http://pi:4533 if MagicDNS is enabled)
+
+Once your friend logs in, they can go to their own settings to change their password.
+
+9. Custom Tags and How They Appear in the Web App:
+--------------------------------------------------
+
+Navidrome parses tags from your audio files and surfaces them across the interface:
+
+1. ALBUM & ALBUM ARTIST:
+   - Natively supported out of the box.
+   - Used to group and display albums in the Albums and Artists views.
+   - Can be toggled as columns in the "Songs" table using the Column Picker icon (top-right of the table).
+
+2. GENRE:
+   - Natively supported out of the box.
+   - Appears in the "Genres" navigation menu and on Album page headers.
+   - Can be enabled as a column in the "Songs" table via the Column Picker icon.
+
+3. LABEL & CATALOG NUMBER:
+   - Navidrome recognizes Label out of the box, and Catalog Number via the alias in navidrome.toml:
+       [Tags.CatalogNumber]
+       Aliases = ["catalog", "catalognumber"]
+   - When you click on any Album, the header displays the Record Label and Catalog # alongside the release year.
+   - You can also view all tags by clicking "..." on any track or album and selecting "Get Info" -> "Raw Tags".
+
+4. RATING:
+   - In the "Songs" view, you can enable the interactive "Rating" (star rating) column via the Column Picker.
+   - Navidrome manages user star ratings in its internal database per user.
+   - The file's embedded RATING tag is indexed and viewable under "Get Info" -> "Raw Tags", and can be used in Smart Playlists (e.g. creating playlists filtering by rating).
+
+10. Automatic Rating Sync to User Profile:
+------------------------------------------
+
+To bridge audio file embedded RATING tags (Vorbis comment / ID3 POPM) directly into your Navidrome user account star column:
+
+A Python script /home/x1/music_server/sync_ratings.py runs automatically in the background using an hourly systemd timer (navidrome-rating-sync.timer).
+
+- Runs incrementally in <1s (only checks new/unrated tracks).
+- To run manual sync at any time:
+    > sudo /home/x1/music_server/.venv/bin/python /home/x1/music_server/sync_ratings.py
+
+- To force resync of all tracks:
+    > sudo /home/x1/music_server/.venv/bin/python /home/x1/music_server/sync_ratings.py --force

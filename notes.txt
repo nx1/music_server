@@ -1,0 +1,113 @@
+Setting up music server on rasberry pi.
+
+Quick Reference: Syncing drive with external PC (Unplug / Re-plug)
+------------------------------------------------------------------
+1. Before unplugging (safely stop services and unmount):
+    > sudo systemctl stop navidrome
+    > sudo systemctl stop plexmediaserver
+    > sudo umount /mnt/norman_2tb
+
+    if "device is busy" use:
+    > sudo lsof +D /mnt/norman_2tb
+
+2. After re-plugging (mount and update everything):
+    > sudo mount -a
+    > sudo systemctl start plexmediaserver
+    > sudo systemctl start navidrome
+    > sudo /home/x1/music_server/.venv/bin/python /home/x1/music_server/sync_ratings.py
+
+1. Ensure ntfs-3g is installed:
+-------------------------------
+    > sudo apt update
+    > sudo apt install ntfs-3g
+
+2. Mount the NTFS drive:
+------------------------
+Find the path to the drive.
+
+x1@pi:~ $ lsblk
+NAME   MAJ:MIN RM   SIZE RO TYPE MOUNTPOINTS
+loop0    7:0    0  17.1M  1 loop /snap/nvim/4861
+loop1    7:1    0    69M  1 loop /snap/core22/2438
+loop2    7:2    0  43.4M  1 loop /snap/snapd/27709
+loop4    7:4    0  43.5M  1 loop /snap/snapd/27740
+loop5    7:5    0  17.1M  1 loop /snap/nvim/4865
+loop6    7:6    0    69M  1 loop /snap/core22/2956
+sda      8:0    0 232.9G  0 disk
+├─sda1   8:1    0   512M  0 part /boot/firmware
+└─sda2   8:2    0 232.4G  0 part /
+sdb      8:16   0   1.8T  0 disk
+├─sdb1   8:17   0    16M  0 part
+└─sdb2   8:18   0   1.8T  0 part   <--- This is us.
+
+Create path and mount drive to it
+
+sudo mkdir -p /mnt/norman_2tb
+sudo mount -t ntfs-3g /dev/sdb2 /mnt/norman_t2b
+
+check it worked
+cd /mnt/norman_2tb/
+ls
+
+3. Make the mounting permanant
+------------------------------
+
+get the uuid of the drive:
+
+x1@pi:/mnt/norman_2tb $ sudo blkid /dev/sdb2
+/dev/sdb2: LABEL="Norman_2TB" BLOCK_SIZE="512" UUID="7E2C52542C520793" TYPE="ntfs" PARTLABEL="Basic data partition" P
+ARTUUID="f7f254c1-4984-4a55-9dcf-5b5ae223c7f5"
+
+
+edit /etc/fstab with the uuid as sudo with the line:
+
+UUID=7E2C52542C520793 /mnt/norman_2tb ntfs-3g defaults,uid=1000,gid=1000,umask=022,nofail 0 0
+
+the nofail argument will mean the pi will not hang on boot if the drive isn't plugged.
+
+
+Test the fstab entry before rebooting:
+
+sudo umount /mnt/norman_2tb/
+sudo mount -a
+
+
+(For Navidrome setup and configuration, see navidrome.txt)
+
+
+4. Troubleshooting: USB Disconnects / Input/output error (UAS Bug)
+------------------------------------------------------------------
+Symptom:
+    "ls: reading directory '.': Input/output error" or dmesg logs:
+    "Buffer I/O error on dev sda2..." followed by USB reset events.
+
+Cause:
+    The USB-to-SATA bridge (e.g. Sabrent with JMicron JMS561U chip, ID 152d:1561)
+    experiences protocol timeouts under UAS (USB Attached SCSI) when handling
+    SSD operations (such as Samsung 870 QVO). The kernel resets the USB port and
+    re-assigns the drive to a new device node (e.g. sdc2), leaving the mount point
+    pointing to an invalid device.
+
+Immediate Recovery:
+    > sudo systemctl stop navidrome
+    > sudo systemctl stop plexmediaserver
+    > sudo umount -l /mnt/norman_2tb
+    > sudo mount -a
+    > sudo systemctl start plexmediaserver
+    > sudo systemctl start navidrome
+
+Permanent Fix (Disable UAS for adapter via kernel quirk):
+    1. Confirm the adapter USB ID:
+       > lsusb
+       (Example: ID 152d:1561 JMicron Technology Corp.)
+
+    2. Edit /boot/firmware/cmdline.txt (keep everything on a single line):
+       Append: usb-storage.quirks=152d:1561:u
+
+    3. Reboot the Pi:
+       > sudo reboot
+
+    4. Verify after boot:
+       > cat /proc/cmdline | grep quirks
+       > ls -l /sys/bus/usb/drivers/usb-storage
+

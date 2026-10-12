@@ -1,0 +1,133 @@
+Tutorial: Resolving External USB SATA SSD Disconnects and I/O Errors on Raspberry Pi
+========================================================================================
+
+1. The Problem & Symptoms
+-------------------------
+When using external USB 3.0 SATA drives (especially SSDs such as the Samsung 870 QVO) 
+on a Raspberry Pi, the drive may randomly crash under I/O load, manifesting as:
+
+- Terminal error when accessing the mount point:
+    ls: reading directory '.': Input/output error
+
+- Kernel log (dmesg / journalctl) errors:
+    Buffer I/O error on dev sda2, logical block ..., async page read
+    usb 4-1: cmd cmplt err -71                  # Hardware protocol error (EPROTO)
+    scsi host0: uas_pre_reset: timed out        # UAS reset failed
+    device offline error, dev sda
+    usb 4-1: reset SuperSpeed USB device...     # USB port hard reset
+
+- The drive disappears as /dev/sda and re-appears as /dev/sdc (or another letter), 
+  leaving the existing mount point bound to a dead device handle.
+
+
+2. Technical Root Cause
+-----------------------
+Linux defaults to using UAS (USB Attached SCSI Protocol) for USB 3.0 mass storage 
+devices because it supports tagged command queueing (NCQ) and out-of-order transfers.
+
+However, many USB-to-SATA bridge controllers—most notoriously JMicron chipsets 
+(e.g., JMS561U, JMS567, JMS578 found in Sabrent and other enclosures)—have buggy 
+firmware that cannot reliably handle SCSI-to-SATA translation or concurrent command 
+queues when paired with the Raspberry Pi's USB 3 controller (xhci-hcd) and high-throughput 
+SATA SSDs.
+
+When the controller locks up, command completions fail (-71 / EPROTO). The Linux UAS 
+driver attempts an in-flight reset, fails, and triggers a full USB bus reset. The drive 
+re-enumerates under a new SCSI letter, breaking all active mounts.
+
+
+3. Diagnostic Procedure
+-----------------------
+Step 1: Check kernel error logs
+    dmesg -T | tail -n 50
+    # Look for "Buffer I/O error", "cmd cmplt err -71", or "uas_pre_reset"
+
+Step 2: Check current block devices and mounts
+    lsblk -f
+    findmnt /mnt/norman_2tb
+    # Note if the actual disk letter (e.g. sdc) differs from the mounted device (e.g. sda)
+
+Step 3: Identify the USB bridge Vendor ID and Product ID
+    lsusb
+    # Example output:
+    # Bus 004 Device 002: ID 152d:1561 JMicron Technology Corp. JMS561U ...
+    # Here, Vendor ID = 152d, Product ID = 1561
+
+Step 4: Check which driver is currently attached to the disk
+    # Replace 'sdb' with your drive's current letter:
+    readlink -f /sys/block/sdb/device/driver
+    # If the path routes to /sys/bus/usb/drivers/uas, the drive is using UAS.
+
+
+4. Immediate Recovery (Without Rebooting)
+-----------------------------------------
+When a drive is in an Input/output error state, processes holding handles on the mount 
+must be stopped and the stale mount lazily detached:
+
+1. Stop services using the storage:
+    sudo systemctl stop navidrome
+    sudo systemctl stop plexmediaserver
+
+2. Unmount the dead mount point cleanly:
+    sudo umount -l /mnt/norman_2tb
+
+3. Re-mount filesystems defined in /etc/fstab:
+    sudo mount -a
+
+4. Verify files are accessible:
+    ls -la /mnt/norman_2tb
+
+5. Restart the services:
+    sudo systemctl start plexmediaserver
+    sudo systemctl start navidrome
+
+
+5. Permanent Resolution: USB Storage Driver Quirk
+-------------------------------------------------
+To eliminate the disconnects permanently, tell the Linux kernel to bypass the UAS 
+driver for this specific device and fall back to standard USB Mass Storage (BOT - 
+Bulk-Only Transport).
+
+Flag reference:
+    :u  = IGNORE_UAS (disables UAS, forces usb-storage)
+
+Step 1: Create a backup of the boot configuration
+    sudo cp /boot/firmware/cmdline.txt /boot/firmware/cmdline.txt.bak
+
+Step 2: Edit /boot/firmware/cmdline.txt
+    IMPORTANT: Raspberry Pi's cmdline.txt MUST remain on a SINGLE line. Do not 
+    insert line breaks.
+
+    Append the quirk parameter to the end of the line, separated by a space:
+    usb-storage.quirks=152d:1561:u
+
+    (Replace 152d:1561 with your specific vendor:product ID if using a different adapter).
+
+    Example full line in /boot/firmware/cmdline.txt:
+    console=serial0,115200 console=tty1 root=PARTUUID=fa1330aa-02 rootfstype=ext4 fsck.repair=yes rootwait quiet splash plymouth.ignore-serial-consoles cfg80211.ieee80211_regdom=GB usb-storage.quirks=152d:1561:u
+
+Step 3: Reboot the system
+    sudo reboot
+
+
+6. Post-Reboot Verification
+---------------------------
+After the system reboots, execute the following checks:
+
+1. Confirm the kernel loaded the parameter:
+    cat /proc/cmdline | grep quirks
+
+2. Confirm the kernel recognized the quirk during USB discovery:
+    journalctl -b -k | grep -i quirks
+    # Expected output:
+    # usb 4-1: UAS is ignored for this device, using usb-storage instead
+    # usb-storage 4-1:1.0: Quirks match for vid 152d pid 1561: 800000
+
+3. Verify driver binding:
+    ls -l /sys/bus/usb/drivers/usb-storage
+    # The adapter interface (e.g. 4-1:1.0) should be symlinked under usb-storage, not uas.
+
+4. Performance note:
+    BOT mode eliminates concurrent queue deadlocks while still providing sustained 
+    USB 3.0 SATA read/write speeds of ~300-350 MB/s, which is well above requirements 
+    for media servers and file storage.
